@@ -541,7 +541,7 @@ void scan_i2c () {
   
   if (nDevices == 0) {
     Serial.println("No power supplies found");
-    Serial.println("Hualting, fix i2c problem");
+    Serial.println("Halting, fix i2c problem");
     while(1);
   } else {
     Serial.println("Setting default voltage");

@@ -1,0 +1,36 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"name": "i2c_scanner",
+			"path": "../../i2c_scanner"
+		},
+		{
+			"name": "OpenMQTTGateway",
+			"path": "../../../../OpenMQTTGateway"
+		},
+		{
+			"name": "Tasmota",
+			"path": "../../../../Tasmota"
+		},
+		{
+			"name": "OLEDTest",
+			"path": "../../../../../Users/chris/Documents/PlatformIO/Projects/OLEDTest"
+		},
+		{
+			"name": "WomoTracker",
+			"path": "../../../../../Users/chris/Documents/PlatformIO/Projects/WomoTracker"
+		},
+		{
+			"name": "HDC1080 Test",
+			"path": "../../../../../Users/chris/Documents/PlatformIO/Projects/HDC1080 Test"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"decoder.h": "c"
+		}
+	}
+}
