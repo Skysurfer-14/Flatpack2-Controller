@@ -253,7 +253,7 @@ void setup() {
   {
     nonVolatile.voltage = 4800;
     nonVolatile.current = 6250;
-    nonVolatile.highvoltage = 5700;
+    nonVolatile.highvoltage = 5900;
     EEPROM.put(0, nonVolatile);
   }
 
