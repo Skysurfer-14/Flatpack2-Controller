@@ -395,7 +395,6 @@ void loop() {
         // Akku angeschlossen?
         if (actualReadVoltage > PSU_VSET_MIN)
         { 
-          actualSetVoltage = actualReadVoltage + 200;   // gelesener Wert von externer Spannung um 2V zu niedrig
           actualSetVoltage = actualReadVoltage;
           actualSetCurrent = nonVolatile.current;
           write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_VOUT, actualSetVoltage); // Spannung setzen (RAM)
@@ -408,16 +407,6 @@ void loop() {
     case ramp_up:
       // display
       displayActual("Ramp_up");
-      // Überspannungs-Überwachung
-      result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_VOUT);
-      actualReadVoltage = in_buffer[0] + (in_buffer[1] << 8); 
-      // Spannung zu hoch?
-      if (actualReadVoltage > actualSetVoltage)
-      {
-        write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_OFF);
-        state = nc_error;
-        break;
-      }
       // Strom lesen
       result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_IOUT);
       actualReadCurrent = in_buffer[0] + (in_buffer[1] << 8);
@@ -437,7 +426,6 @@ void loop() {
       }
       else
       {
-        actualSetVoltage -= 5;
         state = cc_charging;
       }
       break;
@@ -455,7 +443,6 @@ void loop() {
         state = oc_error;
         break;
       }
-      /*
       // Überwachung auf Unterbrechung
       if (actualReadCurrent == 0)
       {
@@ -463,7 +450,6 @@ void loop() {
         state = nc_error;
         break;
       }
-      */
       if (actualReadCurrent < actualSetCurrent)
       {
         // Spannung kleinschrittig erhöhen (0,01V)
