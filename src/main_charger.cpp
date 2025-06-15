@@ -68,6 +68,7 @@ U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R2, /* reset=*/ U8X8_PIN_NONE);
 #define PSU_VSET_MIN        4320  // Minimum Voltage Setting (Volt * 100)
 #define PSU_ISET_MAX        6250  // Maximum Current Setting (Ampere * 100)
 #define PSU_ISET_MIN        0000  // Minimum Current Setting (Ampere * 100)
+#define PSU_VSTART          3000  // Charge Start Voltage
 
 // Prozessor-EEPROM
 struct nonVolatileStruct
@@ -386,14 +387,14 @@ void loop() {
       result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_VOUT);
       actualReadVoltage = in_buffer[0] + (in_buffer[1] << 8);
       // Akku angeschlossen?
-      if (actualReadVoltage > PSU_VSET_MIN)
+      if (actualReadVoltage > PSU_VSTART)
       {
         // Stabile Spannung abwarten
         delay(250);
         result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_VOUT);
         actualReadVoltage = in_buffer[0] + (in_buffer[1] << 8); 
         // Akku angeschlossen?
-        if (actualReadVoltage > PSU_VSET_MIN)
+        if (actualReadVoltage > PSU_VSTART)
         { 
           actualSetVoltage = actualReadVoltage;
           actualSetCurrent = nonVolatile.current;
