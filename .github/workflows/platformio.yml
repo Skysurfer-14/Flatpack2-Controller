@@ -23,3 +23,9 @@ jobs:
 
       - name: Build PlatformIO Project
         run: pio run
+        
+      - name: Archive firmware
+        uses: actions/upload-artifact@v2
+        with:
+          name: firmware
+          path: .pio/build/*/firmware.hex
