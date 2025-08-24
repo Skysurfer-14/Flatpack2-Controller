@@ -244,8 +244,23 @@ void setup() {
   do {
     u8g2.setFont(u8g2_font_profont22_mr);
     u8g2.drawStr(0,14,"FP2-Controller");
+    u8g2.setFont(u8g2_font_profont17_mr);
+    u8g2.drawStr(10,42,"Version 1.10");
   } while ( u8g2.nextPage() );
-  delay(1000);                          // anpassen an die Startup-Zeit des FP2
+
+  // warten, bis AC und BOOST der PSU aktiv ist, Spannung erst mal abschalten
+  // Verlängerung bei der PSU in Revision 1.10 erforderlich
+  for (uint8_t i = 0; i < 200; i++)
+  {
+    result = readPsu(PSU_READ_ADDR, 0x02, PSU_STATUS);
+    Serial.println(in_buffer[0]);
+    if ((in_buffer[0] & (PSU_STAT_BOOST_OK | PSU_STAT_AC_OK)) == (PSU_STAT_BOOST_OK | PSU_STAT_AC_OK))
+    {
+      write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_OFF);
+      break;
+    }
+    delay(100);
+  }
 
   EEPROM.get(0, nonVolatile);
   //nonVolatile.voltage = 20000;      // erneute Initialisierung der EEPROM-Struktur
@@ -257,11 +272,18 @@ void setup() {
     EEPROM.put(0, nonVolatile);
   }
 
-  // PSU auf Default-Werte einstellen
+  // PSU auf Default-Werte einstellen (RAM und EEPROM)
   write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_VOUT, nonVolatile.voltage);
+  write16Psu(PSU_WRITE_ADDR, PSU_VSET_DEFAULT, nonVolatile.voltage);
   write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_ILIMIT, nonVolatile.current);
+  write16Psu(PSU_WRITE_ADDR, PSU_ISET_DEFAULT, nonVolatile.current);
   write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_HVSD, nonVolatile.highvoltage);
+  write16Psu(PSU_WRITE_ADDR, PSU_HVSD_DEFAULT, nonVolatile.highvoltage);
 
+  // PSU einschalten
+  write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_ON);
+
+  
 /*
   // Testkommandos
   result = readPsu(PSU_READ_ADDR, 0x02, PSU_STATUS);
