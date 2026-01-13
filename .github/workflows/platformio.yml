@@ -10,41 +10,52 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # 1️⃣ Repository auschecken
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2️⃣ Python einrichten
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      # 3️⃣ PlatformIO installieren
       - name: Install PlatformIO
         run: pip install platformio
 
+      # 4️⃣ PlatformIO Projekt bauen
       - name: Build PlatformIO Project
         run: pio run
-        
+
+      # 5️⃣ Firmware als GitHub Artifact speichern (optional, 90 Tage)
       - name: Archive firmware (GitHub Artifact)
         uses: actions/upload-artifact@v4
         with:
           name: firmware
           path: .pio/build/*/firmware.hex
 
+      # 6️⃣ Firmware ins Repository committen
       - name: Commit firmware to repository
         run: |
           # Git konfigurieren
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          # Ordner anlegen und Firmware kopieren
+          # Zielordner anlegen
           mkdir -p firmware-bin
-          cp .pio/build/*/firmware.hex firmware-bin/
+
+          # Alle firmware.hex Dateien iterieren und eindeutige Dateinamen vergeben
+          for f in .pio/build/*/firmware.hex; do
+            board_name=$(basename $(dirname "$f"))  # Unterordnername
+            cp "$f" "firmware-bin/firmware-${board_name}-${GITHUB_SHA}.hex"
+          done
 
           # Änderungen committen
           git add firmware-bin/*
           git commit -m "Update firmware for commit $GITHUB_SHA" || echo "No changes to commit"
 
-          # Änderungen pushen (nur wenn push auf main)
+          # Änderungen nur auf main pushen
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
             git push origin HEAD:main
           fi
