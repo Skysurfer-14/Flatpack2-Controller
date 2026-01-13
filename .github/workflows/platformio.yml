@@ -24,8 +24,27 @@ jobs:
       - name: Build PlatformIO Project
         run: pio run
         
-      - name: Archive firmware
+      - name: Archive firmware (GitHub Artifact)
         uses: actions/upload-artifact@v4
         with:
           name: firmware
           path: .pio/build/*/firmware.hex
+
+      - name: Commit firmware to repository
+        run: |
+          # Git konfigurieren
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          # Ordner anlegen und Firmware kopieren
+          mkdir -p firmware-bin
+          cp .pio/build/*/firmware.hex firmware-bin/
+
+          # Änderungen committen
+          git add firmware-bin/*
+          git commit -m "Update firmware for commit $GITHUB_SHA" || echo "No changes to commit"
+
+          # Änderungen pushen (nur wenn push auf main)
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            git push origin HEAD:main
+          fi
