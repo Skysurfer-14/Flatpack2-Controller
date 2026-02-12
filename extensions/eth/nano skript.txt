@@ -1,0 +1,751 @@
+#include <Arduino.h>
+#include <RotaryEncoder.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <U8g2lib.h>
+#include <EEPROM.h>
+
+// =============================================================
+//  NANO – ROBUST UART (WT32 MASTER) + FP2-CODE + LIVE-STATUS
+// =============================================================
+
+// OLED
+U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
+
+// Rotary Encoder Pins
+#define ROTA  2
+#define ROTB  3
+#define ROTSW 4
+
+// PSU I2C Addresses
+#define PSU_WRITE_ADDR  0x00
+#define PSU_READ_ADDR   0x0F
+
+// PSU RAM Offsets
+#define PSU_STATUS          0x00
+#define PSU_MEASURE_VOUT    0x06
+#define PSU_MEASURE_IOUT    0x08
+#define PSU_TEMP_SEC_OR     0x04
+#define PSU_TEMP_SEC_DIODES 0x05
+#define PSU_SETPOINT_ILIMIT 0x0A
+#define PSU_SETPOINT_VOUT   0x0C
+#define PSU_SETPOINT_HVSD   0x0E
+
+// PSU EEPROM
+#define PSU_VSET_DEFAULT    0x72
+#define PSU_ISET_DEFAULT    0x74
+#define PSU_HVSD_DEFAULT    0x76
+
+// Limits
+#define DISPLAY_TIMEOUT     60000
+#define PSU_VSET_MAX        5800
+#define PSU_VSET_MIN        4320
+#define PSU_ISET_MAX        6250
+#define PSU_ISET_MIN        0
+
+// PSU Command, Offset 0x02
+#define PSU_COMMAND 0x02
+#define PSU_CMD_ON 0x02
+#define PSU_CMD_OFF 0x04
+
+// EEPROM struct
+struct nonVolatileStruct {
+  uint16_t voltage;
+  uint16_t current;
+  uint16_t highvoltage;
+};
+
+nonVolatileStruct nonVolatile;
+
+// Runtime values
+float currentVoltage = 0.0;
+float currentCurrent = 0.0;
+uint8_t currentTempOR = 0;
+uint8_t currentTempDiodes = 0;
+uint16_t currentStatus = 0;
+
+uint16_t actualSetVoltageInt = 0;
+uint16_t actualSetCurrentInt = 0;
+bool psuDcOn = false;
+
+// Display state machine
+typedef enum {
+  wait_for_control,
+  setting_u,
+  setting_i,
+  save_dialog,
+  save
+} State_type;
+
+State_type state = wait_for_control;
+bool displayOn = true;
+
+// Rotary encoder
+RotaryEncoder encoder(ROTB, ROTA, RotaryEncoder::LatchMode::FOUR3);
+static int lastPos = 0;
+unsigned long timeButtonPressed = 0;
+unsigned long pressStartTime = 0;
+bool isPressed = false;
+bool wasPressed = false;
+bool wasLongPressReported = false;
+const unsigned long longPressThreshold = 1000;
+
+// I2C buffer
+uint8_t in_buffer[20];
+uint8_t result;
+
+void checkPosition();
+
+// =============================================================
+//  I2C FUNCTIONS (unchanged)
+// =============================================================
+
+uint8_t crc82(uint8_t *p, uint8_t len) {
+  uint8_t chk = 0;
+  for (uint8_t i = 0; i < len; i++) chk += p[i];
+  return 256 - chk;
+}
+
+uint8_t readPsu(uint8_t addr, uint8_t len, uint8_t offs) {
+  int i = 0;
+  uint8_t comm_stat;
+
+  uint8_t data[] = {addr, len, offs};
+  uint8_t crc = crc82(data, sizeof(data));
+
+  Wire.beginTransmission(addr);
+  Wire.write(len);
+  Wire.write(offs);
+  Wire.write(crc);
+  Wire.endTransmission(false);
+
+  len += 3;
+  Wire.requestFrom(addr, len);
+
+  comm_stat = Wire.read();
+  while (Wire.available()) in_buffer[i++] = Wire.read();
+
+  uint16_t crc16 = comm_stat;
+  for (uint8_t j = 0; j < len - 3; j++) crc16 += in_buffer[j];
+  crc16 = ~crc16 + 1;
+
+  if ((in_buffer[len - 3] != (crc16 & 0xFF)) ||
+      (in_buffer[len - 2] != (crc16 >> 8))) {
+    comm_stat |= 0x10;
+  }
+
+  return comm_stat;
+}
+
+void write8Psu(uint8_t addr, uint8_t offs, uint8_t value) {
+  uint8_t data[] = {addr, 1, offs, value};
+  uint8_t crc = crc82(data, sizeof(data));
+
+  Wire.beginTransmission(addr);
+  Wire.write(1);
+  Wire.write(offs);
+  Wire.write(value);
+  Wire.write(crc);
+  Wire.endTransmission();
+}
+
+void write16Psu(uint8_t addr, uint8_t offs, uint16_t value) {
+  uint8_t l = value & 0xFF;
+  uint8_t h = value >> 8;
+  uint8_t data[] = {addr, 2, offs, l, h};
+  uint8_t crc = crc82(data, sizeof(data));
+
+  Wire.beginTransmission(addr);
+  Wire.write(2);
+  Wire.write(offs);
+  Wire.write(l);
+  Wire.write(h);
+  Wire.write(crc);
+  Wire.endTransmission();
+}
+
+// =============================================================
+// INTERRUPT HANDLER FOR ROTARY ENCODER
+// =============================================================
+void checkPosition() {
+  encoder.tick();
+}
+
+// =============================================================
+//  LIVE STATUS UPDATE (NEU: für WT32 STATUS-Frames + OLED Konsistenz)
+// =============================================================
+void updateLiveStatusFromPsu() {
+  // Vout
+  result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_VOUT);
+  if (!(result & 0x10)) {
+    currentVoltage = (float)((in_buffer[0] + (in_buffer[1] << 8))) / 100.0f;
+  }
+
+  // Iout
+  result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_IOUT);
+  if (!(result & 0x10)) {
+    currentCurrent = (float)((in_buffer[0] + (in_buffer[1] << 8))) / 100.0f;
+  }
+
+  // Temp OR
+  result = readPsu(PSU_READ_ADDR, 1, PSU_TEMP_SEC_OR);
+  if (!(result & 0x10)) {
+    currentTempOR = in_buffer[0];
+  }
+
+  // Temp Diodes
+  result = readPsu(PSU_READ_ADDR, 1, PSU_TEMP_SEC_DIODES);
+  if (!(result & 0x10)) {
+    currentTempDiodes = in_buffer[0];
+  }
+
+  // Status word
+  result = readPsu(PSU_READ_ADDR, 2, PSU_STATUS);
+  if (!(result & 0x10)) {
+    currentStatus = (uint16_t)(in_buffer[0] | (in_buffer[1] << 8));
+  }
+}
+
+// =============================================================
+//  DISPLAY FUNCTIONS (minimal angepasst: Titel)
+// =============================================================
+
+void displayActual(const char* sTitle) {
+  // Neu: immer live lesen (damit OLED und WT32 konsistent sind)
+  updateLiveStatusFromPsu();
+
+  float uValue = currentVoltage;
+  float iValue = currentCurrent;
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_profont22_mr);
+    u8g2.setCursor(0,14);
+    u8g2.print(sTitle);
+    u8g2.drawHLine(0,20,128);
+
+    u8g2.setCursor(0,41);
+    u8g2.print(F("U: "));
+    if (uValue < 10.0) u8g2.print(F(" "));
+    u8g2.print(uValue);
+    u8g2.print(F(" V "));
+
+    u8g2.setCursor(0,63);
+    u8g2.print(F("I: "));
+    if (iValue < 10.0) u8g2.print(F(" "));
+    u8g2.print(iValue);
+    u8g2.print(F(" A "));
+  } while (u8g2.nextPage());
+}
+
+void displaySetting(uint8_t lineEdit, uint16_t u, uint16_t i) {
+  float uValue = u / 100.0;
+  float iValue = i / 100.0;
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_profont22_mr);
+    u8g2.setCursor(0,14);
+    u8g2.print(F("Settings"));
+    u8g2.drawHLine(0,20,128);
+
+    u8g2.setCursor(0,41);
+    u8g2.print(F("U: "));
+    u8g2.setDrawColor((lineEdit == 1) ? 0 : 1);
+    if (uValue < 10.0) u8g2.print(F(" "));
+    u8g2.print(uValue);
+    u8g2.setDrawColor(1);
+    u8g2.print(F(" V "));
+
+    u8g2.setCursor(0,63);
+    u8g2.print(F("I: "));
+    u8g2.setDrawColor((lineEdit == 2) ? 0 : 1);
+    if (iValue < 10.0) u8g2.print(F(" "));
+    u8g2.print(iValue);
+    u8g2.setDrawColor(1);
+    u8g2.print(F(" A "));
+  } while (u8g2.nextPage());
+}
+
+// =============================================================
+//  SETUP
+// =============================================================
+
+void setup() {
+  Wire.begin();
+
+  // robust & ausreichend
+  Serial.begin(38400);
+
+  pinMode(ROTSW, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ROTB), checkPosition, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ROTA), checkPosition, CHANGE);
+
+  u8g2.setBusClock(50000);
+  u8g2.begin();
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_profont22_mr);
+    u8g2.setCursor(0,14);
+    u8g2.print(F("FP2-Controller"));
+  } while (u8g2.nextPage());
+  delay(1000);
+
+  EEPROM.get(0, nonVolatile);
+  if (nonVolatile.voltage > 10000) {
+    nonVolatile.voltage = 4800;
+    nonVolatile.current = 6250;
+    nonVolatile.highvoltage = 5900;
+    EEPROM.put(0, nonVolatile);
+  }
+
+  actualSetVoltageInt = nonVolatile.voltage;
+  actualSetCurrentInt = nonVolatile.current;
+
+  write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_ILIMIT, actualSetCurrentInt);
+  write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_VOUT, actualSetVoltageInt);
+  write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_HVSD, nonVolatile.highvoltage);
+
+  timeButtonPressed = millis();
+}
+
+// =============================================================
+//  UART PROTOCOL
+// =============================================================
+
+#define FRAME_START 0xAA
+
+// Commands WT32 → Nano
+#define CMD_SET_VOLTAGE     0x01
+#define CMD_SET_CURRENT     0x02
+#define CMD_CMD_ON          0x03
+#define CMD_CMD_OFF         0x04
+#define CMD_GET_STATUS      0x05
+#define CMD_GET_SETVALUES   0x06
+
+// Commands Nano → WT32
+#define CMD_STATUS_RESPONSE     0x10
+#define CMD_SETVALUES_RESPONSE  0x11
+#define CMD_ACK                 0x20
+#define CMD_NACK                0x21
+#define CMD_HEARTBEAT           0x30
+
+// NACK error codes
+#define ERR_INVALID_VALUE   0x01
+#define ERR_I2C_FAIL        0x02
+#define ERR_CRC_FAIL        0x03
+#define ERR_NOT_ALLOWED     0x04
+#define ERR_INTERNAL        0x05
+
+enum ParserState {
+  WAIT_START,
+  WAIT_LEN,
+  WAIT_PAYLOAD,
+  WAIT_CRC
+};
+
+ParserState parserState = WAIT_START;
+uint8_t frameLen = 0;
+uint8_t frameCmd = 0;
+uint8_t frameData[64];
+uint8_t frameDataPos = 0;
+
+// Robustness: timeout + resync
+unsigned long rxLastByteMs = 0;
+const unsigned long RX_FRAME_TIMEOUT_MS = 30;
+
+// Host-Detection für Display-Text (NEU)
+unsigned long lastMasterRxMs = 0;
+const unsigned long MASTER_PRESENT_TIMEOUT_MS = 6000;
+
+uint8_t crc8_maxim(const uint8_t *data, uint8_t len) {
+  uint8_t crc = 0x00;
+  while (len--) {
+    uint8_t inbyte = *data++;
+    for (uint8_t i = 8; i; i--) {
+      uint8_t mix = (crc ^ inbyte) & 0x01;
+      crc >>= 1;
+      if (mix) crc ^= 0x8C;
+      inbyte >>= 1;
+    }
+  }
+  return crc;
+}
+
+void sendFrame(uint8_t cmd, const uint8_t* data, uint8_t len) {
+  uint8_t buf[80];
+  uint8_t pos = 0;
+
+  buf[pos++] = FRAME_START;
+  buf[pos++] = len + 1;     // LEN = CMD + DATA
+  buf[pos++] = cmd;
+
+  for (uint8_t i = 0; i < len; i++) {
+    buf[pos++] = data[i];
+  }
+
+  uint8_t crc = crc8_maxim(&buf[2], len + 1); // CRC über CMD+DATA
+  buf[pos++] = crc;
+
+  Serial.write(buf, pos);
+  Serial.flush();
+}
+
+void sendAck(uint8_t originalCmd) {
+  uint8_t d[1] = { originalCmd };
+  sendFrame(CMD_ACK, d, 1);
+}
+
+void sendNack(uint8_t originalCmd, uint8_t errorCode) {
+  uint8_t d[2] = { originalCmd, errorCode };
+  sendFrame(CMD_NACK, d, 2);
+}
+
+void sendStatusFrame() {
+  uint8_t d[8];
+
+  uint16_t v = (uint16_t)(currentVoltage * 100.0f);
+  uint16_t c = (uint16_t)(currentCurrent * 100.0f);
+
+  d[0] = v & 0xFF;
+  d[1] = v >> 8;
+  d[2] = c & 0xFF;
+  d[3] = c >> 8;
+  d[4] = currentTempOR;
+  d[5] = currentTempDiodes;
+  d[6] = currentStatus & 0xFF;
+  d[7] = currentStatus >> 8;
+
+  sendFrame(CMD_STATUS_RESPONSE, d, 8);
+}
+
+void sendSetValuesFrame() {
+  uint8_t d[5];
+
+  d[0] = actualSetVoltageInt & 0xFF;
+  d[1] = actualSetVoltageInt >> 8;
+  d[2] = actualSetCurrentInt & 0xFF;
+  d[3] = actualSetCurrentInt >> 8;
+  d[4] = psuDcOn ? 1 : 0;
+
+  sendFrame(CMD_SETVALUES_RESPONSE, d, 5);
+}
+
+unsigned long lastHeartbeat = 0;
+void sendHeartbeat() {
+  uint8_t d[1] = { 0x01 };
+  sendFrame(CMD_HEARTBEAT, d, 1);
+}
+
+void handleFrame(uint8_t cmd, uint8_t* data, uint8_t len) {
+
+  switch (cmd) {
+
+    case CMD_SET_VOLTAGE:
+      if (len != 2) { sendNack(cmd, ERR_INVALID_VALUE); return; }
+      {
+        uint16_t v = data[0] | (data[1] << 8);
+        if (v < PSU_VSET_MIN || v > PSU_VSET_MAX) { sendNack(cmd, ERR_INVALID_VALUE); return; }
+        actualSetVoltageInt = v;
+      }
+      write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_VOUT, actualSetVoltageInt);
+      sendAck(cmd);
+      break;
+
+    case CMD_SET_CURRENT:
+      if (len != 2) { sendNack(cmd, ERR_INVALID_VALUE); return; }
+      {
+        uint16_t c = data[0] | (data[1] << 8);
+        if (c < PSU_ISET_MIN || c > PSU_ISET_MAX) { sendNack(cmd, ERR_INVALID_VALUE); return; }
+        actualSetCurrentInt = c;
+      }
+      write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_ILIMIT, actualSetCurrentInt);
+      sendAck(cmd);
+      break;
+
+    case CMD_CMD_ON:
+      write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_ON);
+      psuDcOn = true;
+      sendAck(cmd);
+      break;
+
+    case CMD_CMD_OFF:
+      write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_OFF);
+      psuDcOn = false;
+      sendAck(cmd);
+      break;
+
+    case CMD_GET_STATUS:
+      sendAck(cmd);
+      updateLiveStatusFromPsu();   // <<< NEU: immer live
+      sendStatusFrame();
+      break;
+
+    case CMD_GET_SETVALUES:
+      sendAck(cmd);
+      Serial.flush();
+      delayMicroseconds(1500);
+      sendSetValuesFrame();
+      Serial.flush();
+      break;
+
+    default:
+      sendNack(cmd, ERR_NOT_ALLOWED);
+      break;
+  }
+}
+
+// UART parser
+void processIncomingByte(uint8_t b) {
+
+  unsigned long now = millis();
+
+  if (parserState != WAIT_START && (now - rxLastByteMs) > RX_FRAME_TIMEOUT_MS) {
+    parserState = WAIT_START;
+  }
+  rxLastByteMs = now;
+
+  if (parserState != WAIT_START && b == FRAME_START) {
+    parserState = WAIT_LEN;
+    return;
+  }
+
+  switch (parserState) {
+
+    case WAIT_START:
+      if (b == FRAME_START) {
+        parserState = WAIT_LEN;
+      }
+      return;
+
+    case WAIT_LEN:
+      if (b == 0 || b > 64) {
+        parserState = WAIT_START;
+        return;
+      }
+      frameLen = b;
+      frameDataPos = 0;
+      parserState = WAIT_PAYLOAD;
+      return;
+
+    case WAIT_PAYLOAD:
+      if (frameDataPos == 0) {
+        frameCmd = b;
+
+        // Master->Slave Whitelist
+        if (frameCmd != CMD_SET_VOLTAGE &&
+            frameCmd != CMD_SET_CURRENT &&
+            frameCmd != CMD_CMD_ON &&
+            frameCmd != CMD_CMD_OFF &&
+            frameCmd != CMD_GET_STATUS &&
+            frameCmd != CMD_GET_SETVALUES)
+        {
+          parserState = WAIT_START;
+          return;
+        }
+
+        // Master ist da (NEU)
+        lastMasterRxMs = millis();
+
+      } else {
+        frameData[frameDataPos - 1] = b;
+      }
+
+      frameDataPos++;
+
+      if (frameDataPos >= frameLen) {
+        parserState = WAIT_CRC;
+      }
+      return;
+
+    case WAIT_CRC:
+    {
+      uint8_t buf[65];
+      buf[0] = frameCmd;
+
+      for (uint8_t i = 0; i < frameLen - 1; i++) {
+        buf[1 + i] = frameData[i];
+      }
+
+      uint8_t calc = crc8_maxim(buf, frameLen);
+
+      if (calc == b) {
+        handleFrame(frameCmd, frameData, frameLen - 1);
+      } else {
+        sendNack(frameCmd, ERR_CRC_FAIL);
+      }
+
+      parserState = WAIT_START;
+      return;
+    }
+  }
+}
+
+// =============================================================
+//  LOOP
+// =============================================================
+void loop() {
+
+  while (Serial.available()) {
+    uint8_t b = Serial.read();
+    processIncomingByte(b);
+  }
+
+  if (millis() - lastHeartbeat > 2000) {
+    sendHeartbeat();
+    lastHeartbeat = millis();
+  }
+
+  int buttonState = digitalRead(ROTSW);
+
+  encoder.tick();
+  int newPos = encoder.getPosition();
+  if (lastPos != newPos) {
+    if (!displayOn) {
+      u8g2.setPowerSave(0);
+      displayOn = true;
+    }
+    timeButtonPressed = millis();
+    lastPos = newPos;
+  }
+
+  if (buttonState == LOW) {
+    timeButtonPressed = millis();
+    if (!isPressed) {
+      pressStartTime = millis();
+      isPressed = true;
+      wasLongPressReported = false;
+    } else if (!wasLongPressReported && (millis() - pressStartTime >= longPressThreshold)) {
+      wasLongPressReported = true;
+      wasPressed = true;
+    }
+  }
+  else if (buttonState == HIGH && isPressed) {
+    isPressed = false;
+    if (!wasLongPressReported) {
+      wasPressed = true;
+    }
+  }
+
+  switch (state)
+  {
+    case wait_for_control:
+      if ((millis() - timeButtonPressed) > DISPLAY_TIMEOUT) {
+        if (displayOn) {
+          u8g2.setPowerSave(1);
+          displayOn = false;
+        }
+      }
+      else {
+        if (!displayOn) {
+          u8g2.setPowerSave(0);
+          displayOn = true;
+        }
+
+        bool masterPresent = (millis() - lastMasterRxMs) <= MASTER_PRESENT_TIMEOUT_MS;
+
+        // Titel nach Host-Status (NEU)
+        char titleBuffer[30];
+        snprintf(titleBuffer, sizeof(titleBuffer),
+                 "%s %.2fV %.2fA",
+                 masterPresent ? "Cerbo" : "Autonom",
+                 actualSetVoltageInt / 100.0f,
+                 actualSetCurrentInt / 100.0f);
+
+        displayActual(titleBuffer);
+
+        if (wasPressed) {
+          encoder.setPosition(nonVolatile.voltage / 100);
+          lastPos = encoder.getPosition();
+          state = setting_u;
+          wasPressed = false;
+        }
+      }
+      break;
+
+    case setting_u:
+      nonVolatile.voltage = encoder.getPosition();
+
+      if (nonVolatile.voltage > PSU_VSET_MAX) {
+        nonVolatile.voltage = PSU_VSET_MAX;
+        encoder.setPosition(PSU_VSET_MAX);
+        lastPos = encoder.getPosition();
+      }
+      else if (nonVolatile.voltage < PSU_VSET_MIN) {
+        nonVolatile.voltage = PSU_VSET_MIN;
+        encoder.setPosition(PSU_VSET_MIN);
+        lastPos = encoder.getPosition();
+      }
+
+      displaySetting(1, nonVolatile.voltage, nonVolatile.current);
+
+      if (wasPressed) {
+        write16Psu(PSU_WRITE_ADDR, PSU_VSET_DEFAULT, nonVolatile.voltage);
+        EEPROM.put(0, nonVolatile);
+
+        encoder.setPosition(nonVolatile.current / 100);
+        lastPos = encoder.getPosition();
+        wasPressed = false;
+        state = setting_i;
+      }
+      break;
+
+    case setting_i:
+      nonVolatile.current = encoder.getPosition();
+
+      if (nonVolatile.current > PSU_ISET_MAX) {
+        nonVolatile.current = PSU_ISET_MAX;
+        encoder.setPosition(PSU_ISET_MAX);
+        lastPos = encoder.getPosition();
+      }
+      else if (nonVolatile.current < PSU_ISET_MIN) {
+        nonVolatile.current = PSU_ISET_MIN;
+        encoder.setPosition(PSU_ISET_MIN);
+        lastPos = encoder.getPosition();
+      }
+
+      displaySetting(2, nonVolatile.voltage, nonVolatile.current);
+
+      if (wasPressed) {
+        write16Psu(PSU_WRITE_ADDR, PSU_ISET_DEFAULT, nonVolatile.current);
+        EEPROM.put(0, nonVolatile);
+        wasPressed = false;
+        state = wait_for_control;
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+// =============================================================
+//  RESTLICHE FUNKTIONEN (unverändert)
+// =============================================================
+
+void scan_i2c () {
+  byte error, address;
+  int nDevices = 0;
+
+  for (address = 0; address < 127; address++ ) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    if (error == 0) {
+      nDevices++;
+    }
+  }
+
+  if (nDevices == 0) {
+    while(1);
+  }
+}
+
+int leseDigitaleingang(int pin, int &vorherigerZustand) {
+  int aktuellerZustand = digitalRead(pin);
+  if (aktuellerZustand != vorherigerZustand) {
+    vorherigerZustand = aktuellerZustand;
+    return aktuellerZustand;
+  } else {
+    return -1;
+  }
+}

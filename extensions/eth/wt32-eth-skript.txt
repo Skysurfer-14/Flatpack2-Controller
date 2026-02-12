@@ -1,0 +1,862 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ETH.h>
+#include <ArduinoOTA.h>
+#include <stdarg.h>
+
+/* ============================================================
+ *  DEBUG
+ * ============================================================ */
+bool DEBUG_ENABLED = true;
+
+void dbg(const String &msg) { if (DEBUG_ENABLED) Serial.println(msg); }
+void dbgf(const char *fmt, ...) {
+  if (!DEBUG_ENABLED) return;
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.println(buf);
+}
+
+/* ============================================================
+ *  WIFI / ETH / OTA
+ * ============================================================ */
+const char* ssid         = "victron-insel";
+const char* password     = "victron-insel";
+const char* ota_password = "victron-insel";
+
+IPAddress localIP(192,168,1,234);
+IPAddress gateway(192,168,1,1);
+IPAddress subnet(255,255,255,0);
+
+AsyncWebServer server(80);
+
+/* ============================================================
+ *  SERIAL → NANO
+ * ============================================================ */
+#define NANO_RX_PIN 5
+#define NANO_TX_PIN 17
+HardwareSerial& nanoSerial = Serial2;
+
+/* ============================================================
+ *  PROTOKOLL
+ * ============================================================ */
+static const uint8_t FRAME_START = 0xAA;
+
+// WT32 → Nano
+static const uint8_t CMD_SET_VOLTAGE   = 0x01;
+static const uint8_t CMD_SET_CURRENT   = 0x02;
+static const uint8_t CMD_CMD_ON        = 0x03;
+static const uint8_t CMD_CMD_OFF       = 0x04;
+static const uint8_t CMD_GET_STATUS    = 0x05;
+static const uint8_t CMD_GET_SETVALUES = 0x06;
+
+// Nano → WT32
+static const uint8_t CMD_STATUS_RESPONSE     = 0x10;
+static const uint8_t CMD_SETVALUES_RESPONSE  = 0x11;
+static const uint8_t CMD_ACK                 = 0x20;
+static const uint8_t CMD_NACK                = 0x21;
+static const uint8_t CMD_HEARTBEAT           = 0x30;
+
+/* ============================================================
+ *  WERTE
+ * ============================================================ */
+float currentVoltage = 0.0f;
+float currentCurrent = 0.0f;
+int currentTempOR = 0;
+int currentTempDiodes = 0;
+uint16_t currentStatus = 0;
+String currentStatusHex = "0x0000";
+
+// "bestätigte" Setpoints (werden nur durch SETVALUES_RESPONSE aktualisiert)
+float targetVoltage = 48.00f;
+float targetCurrent = 5.00f;
+bool psuOn = false;
+
+// letzte Befehlsrückmeldung
+String lastSwitchResult = "—"; // "pending", "OK", "ERR ...", "timeout"
+uint8_t pendingSwitchCmd = 0;
+unsigned long pendingSwitchTime = 0;
+const unsigned long SWITCH_TIMEOUT = 4000;
+
+// optionale Rückmeldung für Setpoints (nur UI)
+String lastSetpointResult = "—"; // "pending", "OK", "ERR ...", "timeout"
+unsigned long pendingSetpointTime = 0;
+const unsigned long SETPOINT_TIMEOUT = 4000;
+
+/* ============================================================
+ *  NANO CONNECT STATE
+ * ============================================================ */
+bool nanoConnected = false;
+unsigned long lastNanoRx = 0;
+const unsigned long NANO_TIMEOUT = 15000;
+
+/* ============================================================
+ *  TIMING
+ * ============================================================ */
+unsigned long lastStatusReq = 0;
+const unsigned long STATUS_INTERVAL = 2000;
+
+/* ============================================================
+ *  CRC8 MAXIM
+ * ============================================================ */
+uint8_t crc8_maxim(const uint8_t *data, uint8_t len) {
+  uint8_t crc = 0x00;
+  while (len--) {
+    uint8_t inbyte = *data++;
+    for (uint8_t i = 0; i < 8; i++) {
+      uint8_t mix = (crc ^ inbyte) & 0x01;
+      crc >>= 1;
+      if (mix) crc ^= 0x8C;
+      inbyte >>= 1;
+    }
+  }
+  return crc;
+}
+
+/* ============================================================
+ *  FRAME SEND
+ * ============================================================ */
+void sendFrame(uint8_t cmd, const uint8_t* data, uint8_t dataLen) {
+  uint8_t len = 1 + dataLen; // CMD + DATA
+  uint8_t buf[80];
+  buf[0] = cmd;
+  for (uint8_t i = 0; i < dataLen; i++) buf[1 + i] = data[i];
+  uint8_t crc = crc8_maxim(buf, len);
+
+  nanoSerial.write(FRAME_START);
+  nanoSerial.write(len);
+  nanoSerial.write(cmd);
+  for (uint8_t i = 0; i < dataLen; i++) nanoSerial.write(data[i]);
+  nanoSerial.write(crc);
+
+  dbgf("[WT32] SENT CMD=0x%02X LEN=%d CRC=0x%02X", cmd, len, crc);
+}
+
+void requestStatus() {
+  sendFrame(CMD_GET_STATUS, nullptr, 0);
+}
+
+void requestSetValues() {
+  sendFrame(CMD_GET_SETVALUES, nullptr, 0);
+}
+
+void sendSetVoltage(float v) {
+  uint16_t iv = (uint16_t)(v * 100.0f);
+  uint8_t d[2] = { (uint8_t)(iv & 0xFF), (uint8_t)((iv >> 8) & 0xFF) };
+  sendFrame(CMD_SET_VOLTAGE, d, 2);
+}
+
+void sendSetCurrent(float c) {
+  uint16_t ic = (uint16_t)(c * 100.0f);
+  uint8_t d[2] = { (uint8_t)(ic & 0xFF), (uint8_t)((ic >> 8) & 0xFF) };
+  sendFrame(CMD_SET_CURRENT, d, 2);
+}
+
+void sendDc(bool on) {
+  sendFrame(on ? CMD_CMD_ON : CMD_CMD_OFF, nullptr, 0);
+}
+
+/* ============================================================
+ *  STATUSWORD: abgeleitete Stati (ohne "Bit-Bedeutungen"-UI)
+ * ============================================================ */
+static inline bool bitIsSet(uint16_t sw, uint8_t b) { return ((sw >> b) & 0x01) != 0; }
+
+String statusWordToBinary(uint16_t sw) {
+  String s;
+  s.reserve(19);
+  for (int i = 15; i >= 0; --i) {
+    s += bitIsSet(sw, (uint8_t)i) ? '1' : '0';
+    if (i % 4 == 0 && i != 0) s += ' ';
+  }
+  return s;
+}
+
+// JSON escaper (minimal für ", \n, \r, \t, \)
+String jsonEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '\"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default: out += c; break;
+    }
+  }
+  return out;
+}
+
+// NOTE: Wir verwenden hier NUR eine grobe Ampel-Logik fürs UI.
+// Wichtig: NICHT das Einschalten blockieren! (dein Fall 0x1106)
+bool hasFault(uint16_t sw) {
+  // echte Faults (die du später anpassen kannst)
+  return bitIsSet(sw, 3)  || // HVSD
+         bitIsSet(sw, 4)  || // FAN_FAIL
+         bitIsSet(sw, 6)  || // INT_TEMP
+         bitIsSet(sw, 9)  || // UVSD
+         bitIsSet(sw, 13) || // MOD_DISABLE
+         bitIsSet(sw, 14);   // SHORT_PIN
+}
+
+bool hasWarn(uint16_t sw) {
+  // alles was "nicht perfekt" ist (inkl. UV_ALARM/REMOTE_OFF/reserved)
+  return bitIsSet(sw, 7)  || // ILIM
+         bitIsSet(sw, 8)  || // UV_ALARM
+         bitIsSet(sw, 12) || // REMOTE_OFF
+         bitIsSet(sw, 5)  || bitIsSet(sw, 10) || bitIsSet(sw, 15);
+}
+
+String healthFromStatus(uint16_t sw) {
+  if (hasFault(sw)) return "FAULT";
+  if (hasWarn(sw))  return "WARN";
+  return "OK";
+}
+
+bool dcMismatch(uint16_t sw) {  // optionaler Hinweis
+  bool dcOn = bitIsSet(sw, 0);
+  bool dcEn = bitIsSet(sw, 11);
+  return dcOn && !dcEn;
+}
+
+/* ============================================================
+ *  FANCY HTML
+ * ============================================================ */
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Flatpack2 — Control</title>
+  <style>
+    :root{
+      --bg0:#0b1020;
+      --bg1:#0f1730;
+      --card: rgba(255,255,255,.06);
+      --line: rgba(255,255,255,.12);
+      --text: rgba(255,255,255,.92);
+      --muted: rgba(255,255,255,.65);
+      --good:#26d07c;
+      --bad:#ff4d4d;
+      --warn:#ffb020;
+      --accent:#6ea8fe;
+      --shadow: 0 10px 30px rgba(0,0,0,.35);
+      --r: 18px;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      color:var(--text);
+      background:
+        radial-gradient(900px 450px at 15% 10%, rgba(110,168,254,.18), transparent 60%),
+        radial-gradient(900px 450px at 80% 30%, rgba(38,208,124,.12), transparent 60%),
+        radial-gradient(900px 450px at 50% 90%, rgba(255,176,32,.10), transparent 60%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+      min-height:100vh;
+      padding:18px;
+    }
+    .wrap{max-width:1100px;margin:0 auto;display:grid;gap:14px}
+    .topbar{
+      display:flex;align-items:center;justify-content:space-between;
+      gap:12px;padding:16px 18px;border:1px solid var(--line);
+      background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.04));
+      border-radius:var(--r);box-shadow:var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+    .title{display:flex;flex-direction:column;gap:3px}
+    .title h1{margin:0;font-size:18px;letter-spacing:.3px}
+    .title .sub{color:var(--muted);font-size:12px}
+    .badges{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}
+    .badge{
+      display:inline-flex;align-items:center;gap:8px;
+      padding:8px 10px;border-radius:999px;
+      border:1px solid var(--line);background:rgba(255,255,255,.06);
+      font-size:12px;color:var(--muted)
+    }
+    .dot{width:9px;height:9px;border-radius:50%}
+    .dot.good{background:var(--good)}
+    .dot.bad{background:var(--bad)}
+    .dot.warn{background:var(--warn)}
+
+    .grid{display:grid;grid-template-columns: 1.1fr .9fr; gap:14px}
+    @media (max-width: 980px){ .grid{grid-template-columns:1fr} }
+
+    .card{
+      border:1px solid var(--line);
+      background:rgba(255,255,255,.06);
+      border-radius:var(--r);
+      box-shadow:var(--shadow);
+      padding:16px;
+      backdrop-filter: blur(12px);
+    }
+    .card h2{
+      margin:0 0 12px 0;
+      font-size:13px;
+      font-weight:750;
+      color:rgba(255,255,255,.86);
+      letter-spacing:.35px;
+      text-transform:uppercase;
+    }
+
+    .kpis{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+    @media (max-width: 520px){ .kpis{grid-template-columns:1fr} }
+
+    .kpi{
+      border:1px solid var(--line);
+      background:rgba(0,0,0,.12);
+      border-radius:16px;
+      padding:14px;
+      position:relative;
+      overflow:hidden;
+    }
+    .kpi .label{color:var(--muted);font-size:12px}
+    .kpi .val{font-size:26px;font-weight:800;margin-top:6px;letter-spacing:.2px}
+    .kpi .unit{font-size:12px;color:var(--muted);margin-left:6px}
+    .kpi .mini{margin-top:8px;height:8px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden}
+    .kpi .fill{height:100%;border-radius:999px;background:linear-gradient(90deg, rgba(110,168,254,.9), rgba(38,208,124,.9)); width:0%}
+
+    .hr{height:1px;background:var(--line);margin:12px 0}
+
+    .btn{
+      border:1px solid var(--line);
+      background:linear-gradient(180deg, rgba(110,168,254,.22), rgba(110,168,254,.10));
+      color:rgba(255,255,255,.92);
+      padding:10px 12px;border-radius:14px;
+      cursor:pointer;font-weight:750;
+      transition:.12s transform, .12s opacity;
+      user-select:none;
+      white-space:nowrap;
+    }
+    .btn:active{transform: translateY(1px)}
+    .btn.danger{background:linear-gradient(180deg, rgba(255,77,77,.22), rgba(255,77,77,.10))}
+    .btn:disabled{opacity:.45;cursor:not-allowed}
+
+    .field{
+      display:flex;align-items:center;gap:10px;
+      border:1px solid var(--line);
+      background:rgba(0,0,0,.10);
+      padding:10px 12px;border-radius:14px;
+      min-width:0;
+    }
+    .field label{font-size:12px;color:var(--muted);white-space:nowrap}
+    .field input{
+      width:120px;
+      background:transparent;color:var(--text);
+      border:none;outline:none;
+      font-size:14px;font-weight:750;
+      min-width:0;
+    }
+    .field input:disabled{opacity:.55}
+    .hint{color:var(--muted);font-size:12px;margin-top:8px}
+
+    /* FIX: Sollfelder + Setzen-Buttons stabil nebeneinander */
+    .row2{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:10px;
+      align-items:center;
+    }
+    @media (max-width: 980px){
+      .row2{ grid-template-columns: 1fr; }
+    }
+    .pair{
+      display:grid;
+      grid-template-columns: 1fr auto;
+      gap:10px;
+      align-items:center;
+      min-width:0;
+    }
+
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace}
+    .statusline{
+      display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap
+    }
+    .pill{
+      padding:8px 10px;border-radius:999px;border:1px solid var(--line);
+      background:rgba(0,0,0,.12);color:rgba(255,255,255,.90);font-size:12px;font-weight:750
+    }
+    .pill.good{border-color:rgba(38,208,124,.35);background:rgba(38,208,124,.10)}
+    .pill.bad{border-color:rgba(255,77,77,.35);background:rgba(255,77,77,.10)}
+    .pill.warn{border-color:rgba(255,176,32,.35);background:rgba(255,176,32,.10)}
+    .note{
+      margin-top:10px;
+      padding:10px 12px;
+      border-radius:14px;
+      border:1px solid var(--line);
+      background:rgba(0,0,0,.12);
+      color:rgba(255,255,255,.86);
+      font-size:12px;
+    }
+    .note.warn{border-color:rgba(255,176,32,.35);background:rgba(255,176,32,.08)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div class="title">
+        <h1>Flatpack2 HE — Controller</h1>
+        <div class="sub">WT32 → Nano · Polling alle 2s</div>
+      </div>
+      <div class="badges">
+        <div class="badge"><span class="dot bad" id="dotNano"></span><span id="nanoText">Nano: offline</span></div>
+        <div class="badge"><span class="dot warn" id="dotPSU"></span><span id="psuText">PSU: —</span></div>
+        <div class="badge"><span class="dot warn" id="dotSwitch"></span><span id="switchText">Switch: —</span></div>
+        <div class="badge"><span class="dot warn" id="dotSetp"></span><span id="setpText">Setpoints: —</span></div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Live</h2>
+        <div class="kpis">
+          <div class="kpi">
+            <div class="label">Aktuelle Spannung</div>
+            <div class="val"><span id="vNow">0.00</span><span class="unit">V</span></div>
+            <div class="mini"><div class="fill" id="vFill"></div></div>
+          </div>
+          <div class="kpi">
+            <div class="label">Aktueller Strom</div>
+            <div class="val"><span id="iNow">0.00</span><span class="unit">A</span></div>
+            <div class="mini"><div class="fill" id="iFill"></div></div>
+          </div>
+          <div class="kpi">
+            <div class="label">FET-Temperatur (TOR)</div>
+            <div class="val"><span id="tOr">0</span><span class="unit">°C</span></div>
+            <div class="mini"><div class="fill" id="tOrFill"></div></div>
+          </div>
+          <div class="kpi">
+            <div class="label">Dioden-Temperatur (TD)</div>
+            <div class="val"><span id="tD">0</span><span class="unit">°C</span></div>
+            <div class="mini"><div class="fill" id="tDFill"></div></div>
+          </div>
+        </div>
+
+        <div class="hint" style="margin-top:10px">
+          Bestätigt gesetzt: <span class="mono" id="setU">0.00</span> V · <span class="mono" id="setI">0.00</span> A
+        </div>
+
+        <div class="hr"></div>
+
+        <div class="row2">
+          <div class="pair">
+            <div class="field">
+              <label>Sollspannung (V)</label>
+              <input id="vSetIn" type="number" step="0.01" min="43.20" max="58.00" disabled/>
+            </div>
+            <button class="btn" id="btnSetV" disabled>Setzen</button>
+          </div>
+
+          <div class="pair">
+            <div class="field">
+              <label>Sollstrom (A)</label>
+              <input id="iSetIn" type="number" step="0.01" min="0.00" max="62.50" disabled/>
+            </div>
+            <button class="btn" id="btnSetI" disabled>Setzen</button>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:10px">
+          <button class="btn" id="btnOn" disabled>Einschalten</button>
+          <button class="btn danger" id="btnOff" disabled>Ausschalten</button>
+          <span class="hint" id="hintConn">Bedienung ist deaktiviert solange Nano offline ist.</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Statuswort</h2>
+        <div class="statusline">
+          <div class="pill" id="pillHex"><span class="mono" id="swHex">0x0000</span></div>
+          <div class="pill" id="pillBin"><span class="mono" id="swBin">0000 0000 0000 0000</span></div>
+          <div class="pill" id="pillHealth">Health: —</div>
+        </div>
+
+        <div class="note warn" id="noteDcMismatch" style="display:none">
+          Hinweis: <b>DC_ON</b> ist gesetzt, aber <b>DC_ENABLE</b> ist nicht gesetzt (kann je nach Firmware/Signalbedeutung normal sein).
+        </div>
+
+        <div class="hint" style="margin-top:10px">
+          Angezeigt wird das Statuswort (Hex/Bin) und ein abgeleiteter Zustand (OK/WARN/FAULT). Einschalten wird <b>nicht</b> mehr blockiert.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let nanoIsConnected = false;
+
+    function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+
+    function setDot(dotId, state){
+      const el = document.getElementById(dotId);
+      el.className = 'dot ' + state;
+    }
+
+    function setPill(el, state){
+      el.className = 'pill ' + state;
+    }
+
+    function setControlsEnabled(en){
+      const ids = ['vSetIn','iSetIn','btnSetV','btnSetI','btnOn','btnOff'];
+      ids.forEach(id => {
+        const e = document.getElementById(id);
+        if (e) e.disabled = !en;
+      });
+      document.getElementById('hintConn').style.display = en ? 'none' : 'inline';
+    }
+
+    function maybeSetInputValue(inputId, valueStr){
+      const el = document.getElementById(inputId);
+      if (!el) return;
+      // überschreibe nicht während der Nutzer tippt
+      if (document.activeElement === el) return;
+      el.value = valueStr;
+    }
+
+    async function updateValues(){
+      try{
+        const r = await fetch('/values', {cache:'no-store'});
+        const data = await r.json();
+
+        nanoIsConnected = !!data.nano_connected;
+        document.getElementById('nanoText').textContent = nanoIsConnected ? 'Nano: online' : 'Nano: offline';
+        setDot('dotNano', nanoIsConnected ? 'good' : 'bad');
+
+        // KPIs
+        document.getElementById('vNow').textContent = (data.voltage ?? 0).toFixed(2);
+        document.getElementById('iNow').textContent = (data.current ?? 0).toFixed(2);
+        document.getElementById('tOr').textContent  = (data.tempOR ?? 0);
+        document.getElementById('tD').textContent   = (data.tempDiodes ?? 0);
+
+        // bestätigte Setpoints (aus SETVALUES_RESPONSE)
+        document.getElementById('setU').textContent = (data.set_voltage ?? 0).toFixed(2);
+        document.getElementById('setI').textContent = (data.set_current ?? 0).toFixed(2);
+
+        // input-Felder initial/bei Nicht-Fokus aktualisieren
+        maybeSetInputValue('vSetIn', (data.set_voltage ?? 0).toFixed(2));
+        maybeSetInputValue('iSetIn', (data.set_current ?? 0).toFixed(2));
+
+        // progress fills
+        const v = (data.voltage ?? 0), i = (data.current ?? 0), tor = (data.tempOR ?? 0), td = (data.tempDiodes ?? 0);
+        document.getElementById('vFill').style.width   = (clamp01((v - 43.2) / (58.0 - 43.2))*100).toFixed(1)+'%';
+        document.getElementById('iFill').style.width   = (clamp01(i / 62.5)*100).toFixed(1)+'%';
+        document.getElementById('tOrFill').style.width = (clamp01(tor / 90.0)*100).toFixed(1)+'%';
+        document.getElementById('tDFill').style.width  = (clamp01(td / 90.0)*100).toFixed(1)+'%';
+
+        // status word
+        document.getElementById('swHex').textContent = data.status_hex || '0x0000';
+        document.getElementById('swBin').textContent = data.status_bin || '0000 0000 0000 0000';
+
+        // health pill + PSU badge
+        const health = data.health || '—';
+        document.getElementById('pillHealth').textContent = 'Health: ' + health;
+
+        let healthState = 'warn';
+        if (health === 'OK') healthState = 'good';
+        if (health === 'WARN') healthState = 'warn';
+        if (health === 'FAULT') healthState = 'bad';
+        setPill(document.getElementById('pillHealth'), healthState);
+
+        const psuOn = !!data.psu_on;
+        document.getElementById('psuText').textContent = 'PSU: ' + (psuOn ? 'EIN' : 'AUS') + ' · ' + health;
+        setDot('dotPSU', psuOn ? (healthState === 'bad' ? 'bad' : 'good') : healthState);
+
+        // switch badge
+        const swr = data.last_switch_result || '—';
+        document.getElementById('switchText').textContent = 'Switch: ' + swr;
+        let swState = 'warn';
+        if (swr === 'OK') swState = 'good';
+        if (String(swr).startsWith('ERR') || swr === 'timeout') swState = 'bad';
+        if (swr === 'pending') swState = 'warn';
+        setDot('dotSwitch', swState);
+
+        // setpoint badge
+        const spr = data.last_setpoint_result || '—';
+        document.getElementById('setpText').textContent = 'Setpoints: ' + spr;
+        let spState = 'warn';
+        if (spr === 'OK') spState = 'good';
+        if (String(spr).startsWith('ERR') || spr === 'timeout') spState = 'bad';
+        if (spr === 'pending') spState = 'warn';
+        setDot('dotSetp', spState);
+
+        // hint
+        document.getElementById('noteDcMismatch').style.display = data.dc_mismatch ? 'block' : 'none';
+
+        // controls enabled: NUR an NanoConnected koppeln (wichtig!)
+        setControlsEnabled(nanoIsConnected);
+
+      }catch(e){
+        nanoIsConnected = false;
+        document.getElementById('nanoText').textContent = 'Nano: offline';
+        setDot('dotNano','bad');
+        setControlsEnabled(false);
+      }
+    }
+
+    document.getElementById('btnSetV').addEventListener('click', async () => {
+      if (!nanoIsConnected) return;
+      const v = parseFloat(document.getElementById('vSetIn').value);
+      if (isNaN(v)) return;
+      await fetch(`/set_voltage?voltage=${v.toFixed(2)}`);
+      await updateValues();
+    });
+
+    document.getElementById('btnSetI').addEventListener('click', async () => {
+      if (!nanoIsConnected) return;
+      const c = parseFloat(document.getElementById('iSetIn').value);
+      if (isNaN(c)) return;
+      await fetch(`/set_current?current=${c.toFixed(2)}`);
+      await updateValues();
+    });
+
+    document.getElementById('btnOn').addEventListener('click', async () => {
+      if (!nanoIsConnected) return;
+      await fetch(`/cmd?c=on`);
+      await updateValues();
+    });
+
+    document.getElementById('btnOff').addEventListener('click', async () => {
+      if (!nanoIsConnected) return;
+      await fetch(`/cmd?c=off`);
+      await updateValues();
+    });
+
+    updateValues();
+    setInterval(updateValues, 2000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+/* ============================================================
+ *  PARSER
+ * ============================================================ */
+enum {WAIT_START,WAIT_LEN,WAIT_PAYLOAD,WAIT_CRC} state = WAIT_START;
+uint8_t flen = 0, fcmd = 0, fdata[64], fpos = 0;
+unsigned long rxLast = 0;
+
+void handleFrame(uint8_t cmd, uint8_t* data, uint8_t len){
+  lastNanoRx = millis();
+  nanoConnected = true;
+
+  if (cmd == CMD_ACK) {
+    // ACK kann für verschiedene Kommandos kommen – wir nutzen ihn hier nur für "pending"-Anzeige
+    if (pendingSwitchCmd) {
+      lastSwitchResult = "OK";
+      pendingSwitchCmd = 0;
+      requestSetValues(); // ON/OFF zuverlässig nachziehen
+    }
+    // wenn wir Setpoints pending hatten, markieren wir erstmal OK,
+    // die "bestätigten" Werte kommen dann aus SETVALUES_RESPONSE
+    if (lastSetpointResult == "pending") {
+      lastSetpointResult = "OK";
+    }
+  }
+  else if (cmd == CMD_NACK && len >= 2) {
+    uint8_t orig = data[0];
+    uint8_t err  = data[1];
+    char tmp[32];
+    snprintf(tmp, sizeof(tmp), "ERR 0x%02X", err);
+
+    // wenn gerade ein Switch pending war, weise NACK diesem zu
+    if (pendingSwitchCmd && orig == pendingSwitchCmd) {
+      lastSwitchResult = String(tmp);
+      pendingSwitchCmd = 0;
+    } else {
+      // ansonsten als Setpoint-Fehler anzeigen
+      lastSetpointResult = String(tmp);
+    }
+  }
+  else if (cmd == CMD_STATUS_RESPONSE && len == 8) {
+    uint16_t v = (uint16_t)(data[0] | (data[1] << 8));
+    uint16_t c = (uint16_t)(data[2] | (data[3] << 8));
+    currentVoltage = v / 100.0f;
+    currentCurrent = c / 100.0f;
+    currentTempOR = (int)data[4];
+    currentTempDiodes = (int)data[5];
+    currentStatus = (uint16_t)(data[6] | (data[7] << 8));
+
+    char hexbuf[10];
+    snprintf(hexbuf, sizeof(hexbuf), "0x%04X", currentStatus);
+    currentStatusHex = String(hexbuf);
+  }
+  else if (cmd == CMD_SETVALUES_RESPONSE && len == 5) {
+    uint16_t v = (uint16_t)(data[0] | (data[1] << 8));
+    uint16_t c = (uint16_t)(data[2] | (data[3] << 8));
+    psuOn = (data[4] != 0);
+
+    // bestätigte Setpoints
+    targetVoltage = v / 100.0f;
+    targetCurrent = c / 100.0f;
+  }
+}
+
+void processByte(uint8_t b){
+  unsigned long now = millis();
+  if (state != WAIT_START && (now - rxLast) > 30) state = WAIT_START;
+  rxLast = now;
+
+  if (state != WAIT_START && b == FRAME_START) { state = WAIT_LEN; return; }
+  if (state == WAIT_START) { if (b == FRAME_START) state = WAIT_LEN; return; }
+
+  if (state == WAIT_LEN) { flen = b; fpos = 0; state = WAIT_PAYLOAD; return; }
+
+  if (state == WAIT_PAYLOAD) {
+    if (fpos == 0) fcmd = b;
+    else fdata[fpos - 1] = b;
+    fpos++;
+    if (fpos >= flen) state = WAIT_CRC;
+    return;
+  }
+
+  if (state == WAIT_CRC) {
+    uint8_t buf[65]; buf[0] = fcmd;
+    for (uint8_t i = 0; i < flen - 1; i++) buf[i + 1] = fdata[i];
+    if (crc8_maxim(buf, flen) == b) handleFrame(fcmd, fdata, flen - 1);
+    state = WAIT_START;
+  }
+}
+
+/* ============================================================
+ *  SETUP
+ * ============================================================ */
+void setup(){
+  Serial.begin(115200);
+  nanoSerial.begin(38400, SERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN);
+
+  WiFi.onEvent([](WiFiEvent_t e){
+    if (e == ARDUINO_EVENT_ETH_GOT_IP) dbg("[ETH] IP ready");
+  });
+
+  ETH.begin();
+  ETH.config(localIP, gateway, subnet);
+
+  WiFi.begin(ssid, password);
+
+  ArduinoOTA.setPassword(ota_password);
+  ArduinoOTA.begin();
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){
+    r->send_P(200, "text/html", index_html);
+  });
+
+  server.on("/values", HTTP_GET, [](AsyncWebServerRequest* r){
+    String health = healthFromStatus(currentStatus);
+
+    String j = "{";
+    j += "\"set_voltage\":" + String(targetVoltage, 2) + ",";
+    j += "\"set_current\":" + String(targetCurrent, 2) + ",";
+    j += "\"voltage\":" + String(currentVoltage, 2) + ",";
+    j += "\"current\":" + String(currentCurrent, 2) + ",";
+    j += "\"tempOR\":" + String(currentTempOR) + ",";
+    j += "\"tempDiodes\":" + String(currentTempDiodes) + ",";
+
+    j += "\"status_hex\":\"" + currentStatusHex + "\",";
+    j += "\"status_bin\":\"" + statusWordToBinary(currentStatus) + "\",";
+
+    j += "\"health\":\"" + health + "\",";
+    j += "\"dc_mismatch\":" + String(dcMismatch(currentStatus) ? "true" : "false") + ",";
+
+    j += "\"nano_connected\":" + String(nanoConnected ? "true" : "false") + ",";
+    j += "\"psu_on\":" + String(psuOn ? "true" : "false") + ",";
+    j += "\"last_switch_result\":\"" + jsonEscape(lastSwitchResult) + "\",";
+    j += "\"last_setpoint_result\":\"" + jsonEscape(lastSetpointResult) + "\"";
+    j += "}";
+
+    r->send(200, "application/json", j);
+  });
+
+  server.on("/set_voltage", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (!nanoConnected) { r->send(503, "text/plain", "Nano not connected"); return; }
+    if (!r->hasParam("voltage")) { r->send(400, "text/plain", "Missing voltage"); return; }
+
+    float v = r->getParam("voltage")->value().toFloat();
+    if (v < 43.20f || v > 58.00f) { r->send(400, "text/plain", "Invalid voltage"); return; }
+
+    lastSetpointResult = "pending";
+    pendingSetpointTime = millis();
+
+    sendSetVoltage(v);
+    requestSetValues(); // bestätigte Werte nachziehen
+    r->send(200, "text/plain", "OK");
+  });
+
+  server.on("/set_current", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (!nanoConnected) { r->send(503, "text/plain", "Nano not connected"); return; }
+    if (!r->hasParam("current")) { r->send(400, "text/plain", "Missing current"); return; }
+
+    float c = r->getParam("current")->value().toFloat();
+    if (c < 0.00f || c > 62.50f) { r->send(400, "text/plain", "Invalid current"); return; }
+
+    lastSetpointResult = "pending";
+    pendingSetpointTime = millis();
+
+    sendSetCurrent(c);
+    requestSetValues(); // bestätigte Werte nachziehen
+    r->send(200, "text/plain", "OK");
+  });
+
+  server.on("/cmd", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (!nanoConnected) { r->send(503, "text/plain", "Nano not connected"); return; }
+    if (!r->hasParam("c")) { r->send(400, "text/plain", "Missing c"); return; }
+
+    String c = r->getParam("c")->value();
+    lastSwitchResult = "pending";
+    pendingSwitchTime = millis();
+
+    if (c == "on")  { pendingSwitchCmd = CMD_CMD_ON;  sendDc(true);  r->send(200, "text/plain", "OK"); return; }
+    if (c == "off") { pendingSwitchCmd = CMD_CMD_OFF; sendDc(false); r->send(200, "text/plain", "OK"); return; }
+
+    r->send(400, "text/plain", "Invalid c");
+  });
+
+  server.begin();
+  dbg("[SETUP] Webserver started");
+}
+
+/* ============================================================
+ *  LOOP
+ * ============================================================ */
+void loop(){
+  ArduinoOTA.handle();
+
+  while (nanoSerial.available()) {
+    processByte((uint8_t)nanoSerial.read());
+  }
+
+  unsigned long now = millis();
+
+  // Nano Timeout
+  if (nanoConnected && now - lastNanoRx > NANO_TIMEOUT) {
+    nanoConnected = false;
+    psuOn = false;
+  }
+
+  // regelmäßiger Status
+  if (nanoConnected && now - lastStatusReq > STATUS_INTERVAL) {
+    requestStatus();
+    lastStatusReq = now;
+  }
+
+  // Switch timeout
+  if (pendingSwitchCmd && now - pendingSwitchTime > SWITCH_TIMEOUT) {
+    lastSwitchResult = "timeout";
+    pendingSwitchCmd = 0;
+  }
+
+  // Setpoint timeout
+  if (lastSetpointResult == "pending" && (now - pendingSetpointTime) > SETPOINT_TIMEOUT) {
+    lastSetpointResult = "timeout";
+  }
+
+  delay(1);
+}
