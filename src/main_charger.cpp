@@ -11,7 +11,6 @@ Todo:
 
 */
 
-// Action-Test
 // The complete list is available here: https://github.com/olikraus/u8g2/wiki/u8g2setupcpp
 // Please update the pin numbers according to your setup. Use U8X8_PIN_NONE if the reset pin is not connected
 U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R2, /* reset=*/ U8X8_PIN_NONE);
@@ -64,12 +63,17 @@ U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R2, /* reset=*/ U8X8_PIN_NONE);
 #define PSU_ISET_DEFAULT    0x74  // RW Power-up default for current limit setpoint
 #define PSU_HVSD_DEFAULT    0x76  // RW Power-up default for HVSD setpoint
 
-#define DISPLAY_TIMEOUT     60000  // OLED Protection Timeout (ms)
+#define DISPLAY_TIMEOUT     60000 // OLED Protection Timeout (ms)
 #define PSU_VSET_MAX        5800  // Maximum Voltage Setting (Volt * 100)
 #define PSU_VSET_MIN        4320  // Minimum Voltage Setting (Volt * 100)
+#define PSU_V_RELOAD_DEFAULT 4800 // Default restart voltage (Volt * 100)
 #define PSU_ISET_MAX        6250  // Maximum Current Setting (Ampere * 100)
 #define PSU_ISET_MIN        0000  // Minimum Current Setting (Ampere * 100)
-#define PSU_VSTART          3000  // Charge Start Voltage
+#define CV_CHARGING_TIMEOUT (30UL * 60UL * 1000UL)
+
+// Charger defines
+#define OC_CURRENT_FACTOR   2     // Threshold factor for OC-Error
+#define OC_ERROR_ENABLED    0     // Enable OC-Error
 
 // Prozessor-EEPROM
 struct nonVolatileStruct
@@ -77,9 +81,17 @@ struct nonVolatileStruct
   uint16_t voltage;
   uint16_t current;
   uint16_t highvoltage;
+  uint16_t reloadVoltage;
+  uint8_t chargeMode;
 };
 
 nonVolatileStruct nonVolatile;
+
+enum ChargeMode : uint8_t
+{
+  single_charge,
+  cycle_charge
+};
 
 uint16_t actualReadVoltage = 0;
 uint16_t actualReadCurrent = 0;
@@ -91,12 +103,15 @@ typedef enum {
   ramp_up,
   cc_charging,
   cv_charging,
+  wait_for_reload,
   charging_done,
   wait_for_nobattery,
   oc_error,
   nc_error,
   setting_u,
   setting_i,
+  setting_reload,
+  setting_charge_mode,
   save_dialog,
   save
 } State_type;
@@ -122,6 +137,7 @@ bool wasLongPressReported = false;
 static int lastPos = 0;
 
 long timeButtonPressed;
+unsigned long cvChargingStartTime = 0;
 
 // Prototypes
 void scan_i2c ();
@@ -141,6 +157,19 @@ void checkPosition()
   encoder.tick(); // just call tick() to check the state.
 }
 
+/**
+ * @brief Reads data from a power supply unit (PSU) over I2C.
+ * 
+ * This function communicates with a PSU via I2C to read a specified number
+ * of bytes from a given address and offset. It calculates and verifies a CRC
+ * to ensure data integrity. If a CRC error is detected, the appropriate bit is set
+ * in the communication status.
+ * 
+ * @param addr The I2C address of the PSU.
+ * @param len The number of data bytes to read from the PSU.
+ * @param offs The offset from which to start reading data.
+ * @return The communication status, with a bit set if a CRC error is detected.
+ */
 uint8_t readPsu(uint8_t addr, uint8_t len, uint8_t offs) 
 {
   int i = 0;
@@ -177,7 +206,15 @@ uint8_t readPsu(uint8_t addr, uint8_t len, uint8_t offs)
   return comm_stat;
 }
 
-//void displayActual(String &sTitle)
+/**
+ * @brief displayActual: Display actual values of the power supply
+ * @param sTitle The title string to be displayed on the first line of the display
+ *
+ * This function reads the actual values of the output voltage and current from the
+ * power supply and displays them on the display. The title string is displayed on
+ * the first line. The values are displayed with two decimal places on the second and
+ * third line.
+ */
 void displayActual(const char* sTitle)
 {
   float uValue, iValue;
@@ -208,7 +245,21 @@ void displayActual(const char* sTitle)
   } while ( u8g2.nextPage() );
 }
 
-// lineEdit: 1 / 2
+
+/**
+ * Displays the settings for voltage and current on the screen.
+ * 
+ * This function renders the voltage (U) and current (I) settings 
+ * using the u8g2 library. The displayed values are converted from 
+ * integer to float by dividing by 100.0. It highlights the field 
+ * currently being edited, as indicated by the lineEdit parameter.
+ *
+ * @param lineEdit Indicates which line (1 for voltage, 2 for current) 
+ *                 is being edited. The corresponding line will be 
+ *                 highlighted.
+ * @param u        The voltage value to be displayed, scaled by 100.
+ * @param i        The current value to be displayed, scaled by 100.
+ */
 void displaySetting(uint8_t lineEdit, uint16_t u, uint16_t i)
 {
   float uValue, iValue;
@@ -241,6 +292,41 @@ void displaySetting(uint8_t lineEdit, uint16_t u, uint16_t i)
   } while ( u8g2.nextPage() );
 }
 
+void displayReloadAndChargeMode(uint8_t lineEdit, uint16_t reloadVoltage, uint8_t chargeMode)
+{
+  float reloadValue = reloadVoltage / 100.0;
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_profont22_mr);
+    u8g2.drawStr(0,14,"Settings");
+    u8g2.drawHLine(0,20,128);
+    u8g2.setFontMode(0);
+
+    u8g2.setCursor(0,41);
+    u8g2.print("R: ");
+    u8g2.setDrawColor((lineEdit == 1) ? 0 : 1);
+    if (reloadValue < 10.0) u8g2.print(" ");
+    u8g2.print(reloadValue);
+    u8g2.setDrawColor(1);
+    u8g2.print(" V ");
+
+    u8g2.setCursor(0,63);
+    u8g2.print("C: ");
+    u8g2.setDrawColor((lineEdit == 2) ? 0 : 1);
+    u8g2.print(chargeMode == cycle_charge ? "Multi" : "Single");
+    u8g2.setDrawColor(1);
+  } while ( u8g2.nextPage() );
+}
+
+/**
+ * @brief Setup function, called once at startup.
+ *
+ * Initialize I2C interface and U8G2 library, display the title string
+ * and wait until the FP2-Charger has finished its startup sequence.
+ * Then, read the non-volatile values from EEPROM and initialize the
+ * power supply with these values.
+ */
 void setup() {
   Wire.begin();
   Serial.begin(115200);
@@ -259,6 +345,8 @@ void setup() {
   do {
     u8g2.setFont(u8g2_font_profont22_mr);
     u8g2.drawStr(0,14,"FP2-Charger");
+    u8g2.setFont(u8g2_font_profont17_mr);
+    u8g2.drawStr(10,42,"Version 2.00");
   } while ( u8g2.nextPage() );
   delay(1000);                          // anpassen an die Startup-Zeit des FP2
 
@@ -269,6 +357,18 @@ void setup() {
     nonVolatile.voltage = 4800;
     nonVolatile.current = 6250;
     nonVolatile.highvoltage = 5900;
+    nonVolatile.reloadVoltage = PSU_V_RELOAD_DEFAULT;
+    nonVolatile.chargeMode = single_charge;
+    EEPROM.put(0, nonVolatile);
+  }
+  if (nonVolatile.reloadVoltage < PSU_VSET_MIN || nonVolatile.reloadVoltage > nonVolatile.voltage)
+  {
+    nonVolatile.reloadVoltage = min(PSU_V_RELOAD_DEFAULT, nonVolatile.voltage);
+    EEPROM.put(0, nonVolatile);
+  }
+  if (nonVolatile.chargeMode > cycle_charge)
+  {
+    nonVolatile.chargeMode = single_charge;
     EEPROM.put(0, nonVolatile);
   }
 
@@ -283,6 +383,25 @@ void setup() {
 }
 
 
+/**
+ * loop(): The main loop of the program. It checks the state of the rotary encoder
+ * and the button. Depending on the state, it either displays the actual values
+ * of the power supply or allows the user to enter new values. 
+ * The states are:
+ * - wait_for_battery: wait for the battery to be connected
+ * - ramp_up: ramp up the voltage to the set value
+ * - cc_charging: keep the voltage at the set value and regulate the current
+ * - cv_charging: keep the voltage at the set value and regulate the current, but
+ *                with a lower current limit
+ * - wait_for_reload: wait until the battery voltage falls to the recharge threshold
+ * - wait_for_nobattery: wait for the battery to be disconnected
+ * - oc_error: display an overcurrent error
+ * - nc_error: display a no connection error
+ * - setting_u: allow the user to set the voltage
+ * - setting_i: allow the user to set the current
+ * - setting_reload: allow the user to set the reload voltage
+ * - setting_charge_mode: allow the user to select single or cycle charge
+ */
 void loop() {
   int buttonState = digitalRead(ROTSW);
 
@@ -388,14 +507,14 @@ void loop() {
       result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_VOUT);
       actualReadVoltage = in_buffer[0] + (in_buffer[1] << 8);
       // Akku angeschlossen?
-      if (actualReadVoltage > PSU_VSTART)
+      if (actualReadVoltage > PSU_VSET_MIN)
       {
         // Stabile Spannung abwarten
         delay(250);
         result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_VOUT);
         actualReadVoltage = in_buffer[0] + (in_buffer[1] << 8); 
         // Akku angeschlossen?
-        if (actualReadVoltage > PSU_VSTART)
+        if (actualReadVoltage > PSU_VSET_MIN)
         { 
           actualSetVoltage = actualReadVoltage;
           actualSetCurrent = nonVolatile.current;
@@ -413,7 +532,7 @@ void loop() {
       result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_IOUT);
       actualReadCurrent = in_buffer[0] + (in_buffer[1] << 8);
       // Überstrom-Überwachung
-      if (actualReadCurrent > actualSetCurrent * 2)
+      if (OC_ERROR_ENABLED && (actualReadCurrent > actualSetCurrent * OC_CURRENT_FACTOR))
       {
         write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_OFF);
         state = oc_error;
@@ -439,7 +558,7 @@ void loop() {
       result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_IOUT);
       actualReadCurrent = in_buffer[0] + (in_buffer[1] << 8);
       // Überstrom-Überwachung
-      if (actualReadCurrent > actualSetCurrent * 2)
+      if (OC_ERROR_ENABLED && (actualReadCurrent > actualSetCurrent * 2))
       {
         write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_OFF);
         state = oc_error;
@@ -455,13 +574,20 @@ void loop() {
       if (actualReadCurrent < actualSetCurrent)
       {
         // Spannung kleinschrittig erhöhen (0,01V)
-        actualSetVoltage++;
-        write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_VOUT, actualSetVoltage); // Spannung setzen (RAM)   
-        delay(250);     
+        actualSetVoltage++;    
       }
+      else
+      {
+        // Spannung kleinschrittig verringern (0,01V)
+        actualSetVoltage--;
+      }
+      write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_VOUT, actualSetVoltage); // Spannung setzen (RAM)   
+      delay(250); 
       // Ladeschlussspannung erreicht?
       if (actualSetVoltage >= nonVolatile.voltage)
       {
+        write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_VOUT, nonVolatile.voltage); // Spannung setzen (RAM)   
+        cvChargingStartTime = millis();
         state = cv_charging;
       }
       break;
@@ -473,7 +599,7 @@ void loop() {
       result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_IOUT);
       actualReadCurrent = in_buffer[0] + (in_buffer[1] << 8);
       // Überstrom-Überwachung
-      if (actualReadCurrent > actualSetCurrent * 2)
+      if (OC_ERROR_ENABLED && (actualReadCurrent > actualSetCurrent * OC_CURRENT_FACTOR))
       {
         write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_OFF);
         state = oc_error;
@@ -484,7 +610,33 @@ void loop() {
       {
         // PSU ausschalten
         write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_OFF);  
-        state = wait_for_nobattery;
+        state = nonVolatile.chargeMode == cycle_charge ? wait_for_reload : wait_for_nobattery;
+        break;
+      }
+      if (actualReadCurrent > uint16_t (actualSetCurrent * 1.5))
+      {
+        // zurück zur Stromregelung, wenn die Batteriespannung durch hohe Last wieder sinkt
+        state = cc_charging;
+      }
+      if (millis() - cvChargingStartTime >= CV_CHARGING_TIMEOUT)
+      {
+        write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_OFF);
+        state = nonVolatile.chargeMode == cycle_charge ? wait_for_reload : wait_for_nobattery;
+      }
+      break;
+
+    case wait_for_reload:
+      // PSU ausgeschaltet lassen, bis die Batteriespannung wieder sinkt.
+      displayActual("Wait Reload");
+      result = readPsu(PSU_READ_ADDR, 2, PSU_MEASURE_VOUT);
+      actualReadVoltage = in_buffer[0] + (in_buffer[1] << 8);
+      if (actualReadVoltage <= nonVolatile.reloadVoltage)
+      {
+        actualSetVoltage = actualReadVoltage;
+        actualSetCurrent = nonVolatile.current;
+        write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_VOUT, actualSetVoltage);
+        write8Psu(PSU_WRITE_ADDR, PSU_COMMAND, PSU_CMD_ON);
+        state = ramp_up;
       }
       break;
 
@@ -526,6 +678,10 @@ void loop() {
         encoder.setPosition(PSU_VSET_MIN);
         lastPos = encoder.getPosition();
       }
+      if (nonVolatile.reloadVoltage > nonVolatile.voltage)
+      {
+        nonVolatile.reloadVoltage = nonVolatile.voltage;
+      }
 
       displaySetting(1, nonVolatile.voltage, nonVolatile.current);
       write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_VOUT, nonVolatile.voltage); // Spannung setzen (RAM)
@@ -565,16 +721,85 @@ void loop() {
       {
         write16Psu(PSU_WRITE_ADDR, PSU_ISET_DEFAULT, nonVolatile.current); // Strom setzen (EEPROM)
         EEPROM.put(0, nonVolatile);
+        encoder.setPosition(nonVolatile.reloadVoltage);
+        lastPos = encoder.getPosition();
+        wasPressed = false;
+        state = setting_reload;
+      }
+      break;
+
+    case setting_reload:
+      nonVolatile.reloadVoltage = encoder.getPosition();
+
+      if (nonVolatile.reloadVoltage > nonVolatile.voltage)
+      {
+        nonVolatile.reloadVoltage = nonVolatile.voltage;
+        encoder.setPosition(nonVolatile.voltage);
+        lastPos = encoder.getPosition();
+      }
+      else if (nonVolatile.reloadVoltage < PSU_VSET_MIN)
+      {
+        nonVolatile.reloadVoltage = PSU_VSET_MIN;
+        encoder.setPosition(PSU_VSET_MIN);
+        lastPos = encoder.getPosition();
+      }
+
+      displayReloadAndChargeMode(1, nonVolatile.reloadVoltage, nonVolatile.chargeMode);
+
+      if (wasPressed)
+      {
+        EEPROM.put(0, nonVolatile);
+        wasPressed = false;
+        encoder.setPosition(nonVolatile.chargeMode);
+        lastPos = encoder.getPosition();
+        state = setting_charge_mode;
+      }
+      break;
+
+    case setting_charge_mode: {
+      int chargeModePosition = encoder.getPosition();
+
+      if (chargeModePosition > cycle_charge)
+      {
+        nonVolatile.chargeMode = cycle_charge;
+        encoder.setPosition(cycle_charge);
+        lastPos = encoder.getPosition();
+      }
+      else if (chargeModePosition < single_charge)
+      {
+        nonVolatile.chargeMode = single_charge;
+        encoder.setPosition(single_charge);
+        lastPos = encoder.getPosition();
+      }
+      else
+      {
+        nonVolatile.chargeMode = chargeModePosition;
+      }
+
+      displayReloadAndChargeMode(2, nonVolatile.reloadVoltage, nonVolatile.chargeMode);
+
+      if (wasPressed)
+      {
+        EEPROM.put(0, nonVolatile);
         wasPressed = false;
         state = wait_for_battery;
       }
       break;
+    }
 
     default:
       break;
   }
 }
 
+/**
+ * \brief Scans the i2c bus for power supplies.
+ *
+ * Prints messages to the serial console indicating which power supplies are found.
+ * If no power supplies are found, prints an error message and loops indefinitely.
+ * If power supplies are found, prints a message indicating that the default voltage
+ * will be set.
+ */
 void scan_i2c () {
   byte error, address;
   int nDevices = 0;
@@ -610,6 +835,18 @@ void scan_i2c () {
   }
 }
 
+/**
+ * Calculates the CRC8 checksum for a given array of bytes.
+ *
+ * This function computes a simple checksum by summing all bytes in the input
+ * array and then subtracting the result from 256. The checksum is used to
+ * ensure data integrity when transmitting or storing data.
+ *
+ * @param p Pointer to the array of bytes for which the checksum is calculated.
+ * @param len The number of bytes in the input array.
+ * @return The calculated CRC8 checksum.
+ */
+
 uint8_t crc82(uint8_t *p, uint8_t len) 
 {
   uint8_t chk = 0;
@@ -622,6 +859,14 @@ uint8_t crc82(uint8_t *p, uint8_t len)
   return chk;
 }
 
+/**
+ * Write a byte to the specified PSU register at the given address.
+ * Automatically calculates and appends the CRC8 checksum.
+ *
+ * @param addr The I2C address of the PSU.
+ * @param offs The offset of the register to be written.
+ * @param value The value to be written.
+ */
 void write8Psu(uint8_t addr, uint8_t offs, uint8_t value)
 {
   uint8_t len = 1;
@@ -635,6 +880,14 @@ void write8Psu(uint8_t addr, uint8_t offs, uint8_t value)
   Wire.endTransmission();
 }
 
+/**
+ * Write a 16-bit value to the specified PSU register at the given address.
+ * Automatically calculates and appends the CRC8 checksum.
+ *
+ * @param addr The I2C address of the PSU.
+ * @param offs The offset of the register to be written.
+ * @param value The value to be written.
+ */
 void write16Psu(uint8_t addr, uint8_t offs, uint16_t value)
 {
   uint8_t len = 2;
@@ -678,6 +931,18 @@ void readPsu(uint8_t addr, uint8_t p, uint8_t offs) {
 */
 
 
+/**
+ * Liest den digitalen Zustand des angegebenen Pins und
+ * vergleicht ihn mit dem vorherigen Zustand.
+ * Wenn sich der Zustand geändert hat, wird der neue Zustand
+ * zurückgegeben. Wenn sich der Zustand nicht geändert hat, wird -1
+ * zurückgegeben.
+ * @param pin Der Pin, dessen Zustand gelesen werden soll.
+ * @param vorherigerZustand Referenz auf eine Variable, die den
+ * vorherigen Zustand des Pins speichert.
+ * @return Der neue Zustand des Pins, oder -1 wenn sich der Zustand
+ * nicht geändert hat.
+ */
 int leseDigitaleingang(int pin, int &vorherigerZustand) {
   int aktuellerZustand = digitalRead(pin);
   if (aktuellerZustand != vorherigerZustand) {
