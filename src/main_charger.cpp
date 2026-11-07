@@ -346,7 +346,7 @@ void setup() {
     u8g2.setFont(u8g2_font_profont22_mr);
     u8g2.drawStr(0,14,"FP2-Charger");
     u8g2.setFont(u8g2_font_profont17_mr);
-    u8g2.drawStr(10,42,"Version 2.00");
+    u8g2.drawStr(10,42,"Version 2.01");
   } while ( u8g2.nextPage() );
   delay(1000);                          // anpassen an die Startup-Zeit des FP2
 
@@ -456,51 +456,45 @@ void loop() {
     lastPos = newPos;
   } // if
 
+  // Display timeout applies in every state.
+  if ((millis() - timeButtonPressed) > DISPLAY_TIMEOUT)
+  {
+    if (displayOn)
+    {
+      u8g2.setPowerSave(1);
+      displayOn = false;
+      Serial.println("Display off");
+    }
+  }
+  else if (!displayOn)
+  {
+    u8g2.setPowerSave(0);
+    displayOn = true;
+    Serial.println("Display on");
+  }
 
   switch (state)
   {
     case wait_for_battery:
-      // Display nach gewisser Zeit ausschalten
-      if ((millis() - timeButtonPressed) > DISPLAY_TIMEOUT)
-      {
-        if (displayOn)
-        {
-          // Display off
-          u8g2.setPowerSave(1);
-          displayOn = false;
-          Serial.println("Display off");
-        }
-      }
-      else
-      {
-        if (!displayOn)
-        {
-          u8g2.setPowerSave(0);
-          displayOn = true;
-          Serial.println("Display on");
-        }
+      displayActual("Connect");
 
-        // OLED aktualisieren
-        displayActual("Connect");
-
-        // Tastendruck
-        if (wasPressed) 
+      // Tastendruck
+      if (wasPressed)
+      {
+        if (wasLongPressReported)
         {
-          if (wasLongPressReported)
-          {
-            encoder.setPosition(nonVolatile.voltage);
-            lastPos = encoder.getPosition();
-            state = setting_u;
-          }
-          // Bei kurzem Tastendruck in die Settings
-          else
-          {
-            encoder.setPosition(nonVolatile.voltage);
-            lastPos = encoder.getPosition();
-            state = setting_u;
-          }
-          wasPressed = false;  
+          encoder.setPosition(nonVolatile.voltage);
+          lastPos = encoder.getPosition();
+          state = setting_u;
         }
+        // Bei kurzem Tastendruck in die Settings
+        else
+        {
+          encoder.setPosition(nonVolatile.voltage);
+          lastPos = encoder.getPosition();
+          state = setting_u;
+        }
+        wasPressed = false;
       }
 
       // Spannung lesen
