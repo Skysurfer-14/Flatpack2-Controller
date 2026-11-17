@@ -74,6 +74,7 @@ U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R2, /* reset=*/ U8X8_PIN_NONE);
 // Charger defines
 #define OC_CURRENT_FACTOR   2     // Threshold factor for OC-Error
 #define OC_ERROR_ENABLED    0     // Enable OC-Error
+#define CC_CURRENTHYST      20    // Current Hysteresis (Ampere * 100)
 
 // Prozessor-EEPROM
 struct nonVolatileStruct
@@ -403,6 +404,7 @@ void setup() {
  * - setting_charge_mode: allow the user to select single or cycle charge
  */
 void loop() {
+  const uint16_t currentHysteresis = CC_CURRENTHYST;
   int buttonState = digitalRead(ROTSW);
 
   if (buttonState == LOW) 
@@ -565,14 +567,15 @@ void loop() {
         state = nc_error;
         break;
       }
-      if (actualReadCurrent < actualSetCurrent)
+      // Stromregelung: Spannung anpassen, wenn der Strom nicht im Toleranzbereich liegt
+      if (actualReadCurrent < actualSetCurrent &&
+          actualSetCurrent - actualReadCurrent > currentHysteresis)
       {
-        // Spannung kleinschrittig erhöhen (0,01V)
-        actualSetVoltage++;    
+        actualSetVoltage++;
       }
-      else
+      else if (actualReadCurrent > actualSetCurrent &&
+              actualReadCurrent - actualSetCurrent > currentHysteresis)
       {
-        // Spannung kleinschrittig verringern (0,01V)
         actualSetVoltage--;
       }
       write16Psu(PSU_WRITE_ADDR, PSU_SETPOINT_VOUT, actualSetVoltage); // Spannung setzen (RAM)   
